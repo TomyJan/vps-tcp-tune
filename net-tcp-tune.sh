@@ -21922,11 +21922,23 @@ model_viewer_deploy() {
     mv_port="${mv_port:-$MODEL_VIEWER_DEFAULT_PORT}"
 
     echo ""
-    echo -e "${gl_kjlan}配置 API Key（回车跳过，跳过的提供商将显示「未配置」）${gl_bai}"
+    echo -e "${gl_kjlan}配置各提供商（回车跳过 = 不启用该提供商）${gl_bai}"
+    echo -e "${gl_hui}API 地址默认为官方，如使用反代请替换为你的反代地址${gl_bai}"
     echo ""
-    read -e -p "Anthropic API Key: " mv_anthropic_key
-    read -e -p "OpenAI API Key: " mv_openai_key
-    read -e -p "Google Gemini API Key: " mv_google_key
+    echo -e "${gl_kjlan}── Claude ──${gl_bai}"
+    read -e -p "API 地址 [https://api.anthropic.com]: " mv_anthropic_url
+    mv_anthropic_url="${mv_anthropic_url:-https://api.anthropic.com}"
+    read -e -p "API Key: " mv_anthropic_key
+    echo ""
+    echo -e "${gl_kjlan}── OpenAI / GPT ──${gl_bai}"
+    read -e -p "API 地址 [https://api.openai.com]: " mv_openai_url
+    mv_openai_url="${mv_openai_url:-https://api.openai.com}"
+    read -e -p "API Key: " mv_openai_key
+    echo ""
+    echo -e "${gl_kjlan}── Google Gemini ──${gl_bai}"
+    read -e -p "API 地址 [https://generativelanguage.googleapis.com]: " mv_google_url
+    mv_google_url="${mv_google_url:-https://generativelanguage.googleapis.com}"
+    read -e -p "API Key: " mv_google_key
 
     # 创建目录
     mkdir -p "$MODEL_VIEWER_INSTALL_DIR"
@@ -21935,8 +21947,11 @@ model_viewer_deploy() {
     cat > "$MODEL_VIEWER_CONFIG" << CONFIGEOF
 {
     "port": ${mv_port},
+    "anthropic_base_url": "${mv_anthropic_url}",
     "anthropic_api_key": "${mv_anthropic_key}",
+    "openai_base_url": "${mv_openai_url}",
     "openai_api_key": "${mv_openai_key}",
+    "google_base_url": "${mv_google_url}",
     "google_api_key": "${mv_google_key}",
     "cache_ttl_seconds": 300
 }
@@ -21963,11 +21978,13 @@ function getCached(k) {
 }
 function setCache(k, d) { cache[k] = { d, t: Date.now() }; }
 
-function httpsGet(url, headers) {
+function httpGet(url, headers) {
     return new Promise((resolve, reject) => {
         const u = new URL(url);
-        const req = https.request({
+        const mod = u.protocol === 'https:' ? https : http;
+        const req = mod.request({
             hostname: u.hostname,
+            port: u.port || (u.protocol === 'https:' ? 443 : 80),
             path: u.pathname + u.search,
             method: 'GET',
             headers: headers || {}
@@ -21991,14 +22008,15 @@ async function fetchClaude() {
     if (!cfg.anthropic_api_key) return { provider: 'claude', error: 'API Key 未配置', models: [] };
     try {
         let all = [];
-        let url = 'https://api.anthropic.com/v1/models?limit=100';
+        const aBase = (cfg.anthropic_base_url || 'https://api.anthropic.com').replace(/\/+$/, '');
+        let url = aBase + '/v1/models?limit=100';
         const h = { 'x-api-key': cfg.anthropic_api_key, 'anthropic-version': '2023-06-01' };
         while (url) {
-            const { status, data } = await httpsGet(url, h);
+            const { status, data } = await httpGet(url, h);
             if (status !== 200) throw new Error(data.error?.message || 'HTTP ' + status);
             all = all.concat(data.data || []);
             url = (data.has_more && data.last_id)
-                ? 'https://api.anthropic.com/v1/models?limit=100&after_id=' + data.last_id : null;
+                ? aBase + '/v1/models?limit=100&after_id=' + data.last_id : null;
         }
         const result = {
             provider: 'claude',
@@ -22018,7 +22036,8 @@ async function fetchOpenAI() {
     if (c) return c;
     if (!cfg.openai_api_key) return { provider: 'openai', error: 'API Key 未配置', models: [] };
     try {
-        const { status, data } = await httpsGet('https://api.openai.com/v1/models', {
+        const oBase = (cfg.openai_base_url || 'https://api.openai.com').replace(/\/+$/, '');
+        const { status, data } = await httpGet(oBase + '/v1/models', {
             'Authorization': 'Bearer ' + cfg.openai_api_key
         });
         if (status !== 200) throw new Error(data.error?.message || 'HTTP ' + status);
@@ -22040,9 +22059,10 @@ async function fetchGemini() {
     if (c) return c;
     if (!cfg.google_api_key) return { provider: 'gemini', error: 'API Key 未配置', models: [] };
     try {
-        const url = 'https://generativelanguage.googleapis.com/v1beta/models?key='
+        const gBase = (cfg.google_base_url || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+        const url = gBase + '/v1beta/models?key='
             + encodeURIComponent(cfg.google_api_key) + '&pageSize=1000';
-        const { status, data } = await httpsGet(url, {});
+        const { status, data } = await httpGet(url, {});
         if (status !== 200) throw new Error(data.error?.message || 'HTTP ' + status);
         const result = {
             provider: 'gemini',
@@ -22313,32 +22333,50 @@ model_viewer_config() {
     if [ -f "$MODEL_VIEWER_CONFIG" ]; then
         echo -e "${gl_kjlan}当前配置:${gl_bai}"
         echo -e "  端口: $(model_viewer_get_port)"
-        local ak ok gk
+        local au ou gu ak ok gk
+        au=$(grep -o '"anthropic_base_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')
+        ou=$(grep -o '"openai_base_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')
+        gu=$(grep -o '"google_base_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')
         ak=$(grep -o '"anthropic_api_key"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')
         ok=$(grep -o '"openai_api_key"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')
         gk=$(grep -o '"google_api_key"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')
-        echo -e "  Anthropic Key: ${ak:+已配置}${ak:-未配置}"
-        echo -e "  OpenAI Key:    ${ok:+已配置}${ok:-未配置}"
-        echo -e "  Google Key:    ${gk:+已配置}${gk:-未配置}"
+        echo -e "  Claude:  ${gl_zi}${au:-未配置}${gl_bai}  Key=${ak:+已配置}${ak:-未配置}"
+        echo -e "  OpenAI:  ${gl_zi}${ou:-未配置}${gl_bai}  Key=${ok:+已配置}${ok:-未配置}"
+        echo -e "  Gemini:  ${gl_zi}${gu:-未配置}${gl_bai}  Key=${gk:+已配置}${gk:-未配置}"
         echo ""
     fi
 
     echo -e "${gl_hui}直接回车保持不变${gl_bai}"
     echo ""
     read -e -p "监听端口 [$(model_viewer_get_port)]: " new_port
-    read -e -p "Anthropic API Key: " new_ak
-    read -e -p "OpenAI API Key: " new_ok
-    read -e -p "Google Gemini API Key: " new_gk
+    echo ""
+    echo -e "${gl_kjlan}── Claude ──${gl_bai}"
+    read -e -p "API 地址: " new_au
+    read -e -p "API Key: " new_ak
+    echo ""
+    echo -e "${gl_kjlan}── OpenAI / GPT ──${gl_bai}"
+    read -e -p "API 地址: " new_ou
+    read -e -p "API Key: " new_ok
+    echo ""
+    echo -e "${gl_kjlan}── Google Gemini ──${gl_bai}"
+    read -e -p "API 地址: " new_gu
+    read -e -p "API Key: " new_gk
 
-    local final_port final_ak final_ok final_gk final_ttl
+    local final_port final_au final_ou final_gu final_ak final_ok final_gk final_ttl
     if [ -f "$MODEL_VIEWER_CONFIG" ]; then
         final_port="${new_port:-$(model_viewer_get_port)}"
+        final_au="${new_au:-$(grep -o '"anthropic_base_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')}"
+        final_ou="${new_ou:-$(grep -o '"openai_base_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')}"
+        final_gu="${new_gu:-$(grep -o '"google_base_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')}"
         final_ak="${new_ak:-$(grep -o '"anthropic_api_key"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')}"
         final_ok="${new_ok:-$(grep -o '"openai_api_key"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')}"
         final_gk="${new_gk:-$(grep -o '"google_api_key"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_VIEWER_CONFIG" | sed 's/.*: *"//' | sed 's/"$//')}"
         final_ttl=$(grep -o '"cache_ttl_seconds"[[:space:]]*:[[:space:]]*[0-9]*' "$MODEL_VIEWER_CONFIG" | grep -o '[0-9]*$')
     else
         final_port="${new_port:-$MODEL_VIEWER_DEFAULT_PORT}"
+        final_au="$new_au"
+        final_ou="$new_ou"
+        final_gu="$new_gu"
         final_ak="$new_ak"
         final_ok="$new_ok"
         final_gk="$new_gk"
@@ -22349,8 +22387,11 @@ model_viewer_config() {
     cat > "$MODEL_VIEWER_CONFIG" << CONFIGEOF
 {
     "port": ${final_port},
+    "anthropic_base_url": "${final_au}",
     "anthropic_api_key": "${final_ak}",
+    "openai_base_url": "${final_ou}",
     "openai_api_key": "${final_ok}",
+    "google_base_url": "${final_gu}",
     "google_api_key": "${final_gk}",
     "cache_ttl_seconds": ${final_ttl}
 }
